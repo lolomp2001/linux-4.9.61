@@ -37,6 +37,7 @@
 #include <linux/uaccess.h>
 #include <linux/pm_runtime.h>
 #include <linux/io.h>
+#include <linux/pci.h>
 #ifdef CONFIG_SPARC
 #include <linux/sunserialcore.h>
 #endif
@@ -94,6 +95,183 @@ struct irq_info {
 static struct hlist_head irq_lists[NR_IRQ_HASH];
 static DEFINE_MUTEX(hash_mutex);	/* Used to walk the hash */
 
+#define serial_inp(up, offset)		serial_in(up, offset)
+#define serial_outp(up, offset, value)	serial_out(up, offset, value)
+
+static unsigned int check_modem_status(struct uart_8250_port *up)
+{
+	unsigned int status = serial_in(up, UART_MSR);
+
+	status |= up->msr_saved_flags;
+	up->msr_saved_flags = 0;
+	if (status & UART_MSR_ANY_DELTA && up->ier & UART_IER_MSI &&
+	    up->port.state != NULL) {
+		if (status & UART_MSR_TERI)
+			up->port.icount.rng++;
+		if (status & UART_MSR_DDSR)
+			up->port.icount.dsr++;
+		if (status & UART_MSR_DDCD)
+			uart_handle_dcd_change(&up->port, status & UART_MSR_DCD);
+		if (status & UART_MSR_DCTS)
+			uart_handle_cts_change(&up->port, status & UART_MSR_CTS);
+
+		wake_up_interruptible(&up->port.state->port.delta_msr_wait);
+	}
+
+	return status;
+}
+
+static void
+receive_chars(struct uart_8250_port *up, unsigned int *status)
+{
+	//struct tty_struct *tty = up->port.state->port.tty;
+	struct tty_port *portTmp = &up->port.state->port;
+	unsigned char ch, lsr = *status;
+	int max_count = 256;
+	char flag;
+
+	do {
+		if (likely(lsr & UART_LSR_DR))
+			ch = serial_inp(up, UART_RX);
+		else
+			 
+			ch = 0;
+
+		flag = TTY_NORMAL;
+		up->port.icount.rx++;
+
+		lsr |= up->lsr_saved_flags;
+		up->lsr_saved_flags = 0;
+
+		if (unlikely(lsr & UART_LSR_BRK_ERROR_BITS)) {
+			 
+			if (lsr & UART_LSR_BI) {
+				lsr &= ~(UART_LSR_FE | UART_LSR_PE);
+				up->port.icount.brk++;
+				 
+				if (up->port.type == PORT_TEGRA)
+					//clear_rx_fifo(up);
+
+				if (uart_handle_break(&up->port))
+					goto ignore_char;
+			} else if (lsr & UART_LSR_PE)
+				up->port.icount.parity++;
+			else if (lsr & UART_LSR_FE)
+				up->port.icount.frame++;
+			if (lsr & UART_LSR_OE)
+				up->port.icount.overrun++;
+
+			lsr &= up->port.read_status_mask;
+
+			if (lsr & UART_LSR_BI) {
+				flag = TTY_BREAK;
+			} else if (lsr & UART_LSR_PE)
+				flag = TTY_PARITY;
+			else if (lsr & UART_LSR_FE)
+				flag = TTY_FRAME;
+		}
+		if (uart_handle_sysrq_char(&up->port, ch))
+			goto ignore_char;
+
+		uart_insert_char(&up->port, lsr, UART_LSR_OE, ch, flag);
+
+ignore_char:
+		lsr = serial_inp(up, UART_LSR);
+	} while ((lsr & (UART_LSR_DR | UART_LSR_BI)) && (max_count-- > 0));
+	spin_unlock(&up->port.lock);
+	tty_flip_buffer_push(portTmp);
+	spin_lock(&up->port.lock);
+	*status = lsr;
+}
+
+static inline void __stop_tx(struct uart_8250_port *p)
+{
+	if (p->ier & UART_IER_THRI) {
+		p->ier &= ~UART_IER_THRI;
+		serial_out(p, UART_IER, p->ier);
+	}
+}
+
+static void serial_icr_write(struct uart_8250_port *up, int offset, int value)
+{
+	serial_out(up, UART_SCR, offset);
+	serial_out(up, UART_ICR, value);
+}
+
+#define BOTH_EMPTY 	(UART_LSR_TEMT | UART_LSR_THRE)
+
+static void serial8250_stop_tx(struct uart_port *port)
+{
+	struct uart_8250_port *up =
+		container_of(port, struct uart_8250_port, port);
+
+	__stop_tx(up);
+
+	if (up->port.type == PORT_16C950) {
+		up->acr |= UART_ACR_TXDIS;
+		serial_icr_write(up, UART_ACR, up->acr);
+	}
+}
+
+static void transmit_chars(struct uart_8250_port *up)
+{
+	struct circ_buf *xmit = &up->port.state->xmit;
+	int count;
+
+	if (up->port.x_char) {
+		serial_outp(up, UART_TX, up->port.x_char);
+		up->port.icount.tx++;
+		up->port.x_char = 0;
+		return;
+	}
+	if (uart_tx_stopped(&up->port)) {
+		serial8250_stop_tx(&up->port);
+		return;
+	}
+	if (uart_circ_empty(xmit)) {
+		__stop_tx(up);
+		return;
+	}
+
+	count = up->tx_loadsz;
+	do {
+		serial_out(up, UART_TX, xmit->buf[xmit->tail]);
+		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+		up->port.icount.tx++;
+		if (uart_circ_empty(xmit))
+			break;
+		if (up->capabilities & UART_CAP_HFIFO) {
+			if ((serial_in(up, UART_LSR) & BOTH_EMPTY) !=
+			    BOTH_EMPTY)
+				break;
+		}
+	} while (--count > 0);
+
+	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+		uart_write_wakeup(&up->port);
+
+	if (uart_circ_empty(xmit))
+		__stop_tx(up);
+}
+
+static void serial8250_handle_port(struct uart_8250_port *up)
+{
+	unsigned int status;
+	unsigned long flags;
+
+	spin_lock_irqsave(&up->port.lock, flags);
+
+	status = serial_inp(up, UART_LSR);
+
+	if (status & (UART_LSR_DR | UART_LSR_BI))
+		receive_chars(up, &status);
+	check_modem_status(up);
+	if (status & UART_LSR_THRE)
+		transmit_chars(up);
+
+	spin_unlock_irqrestore(&up->port.lock, flags);
+}
+
 /*
  * This is the serial driver's interrupt routine.
  *
@@ -113,38 +291,56 @@ static irqreturn_t serial8250_interrupt(int irq, void *dev_id)
 	struct irq_info *i = dev_id;
 	struct list_head *l, *end = NULL;
 	int pass_counter = 0, handled = 0;
-
-	pr_debug("%s(%d): start\n", __func__, irq);
-
+	unsigned int my_flags, ier, lsr;
 	spin_lock(&i->lock);
-
 	l = i->head;
 	do {
 		struct uart_8250_port *up;
-		struct uart_port *port;
-
+		unsigned int iir;
+		my_flags = 0x00;
 		up = list_entry(l, struct uart_8250_port, list);
-		port = &up->port;
-
-		if (port->handle_irq(port)) {
+		iir = serial_in(up, UART_IIR);
+		if (!(iir & UART_IIR_NO_INT)) {
+			serial8250_handle_port(up);
+			my_flags |= 0x01;
 			handled = 1;
 			end = NULL;
-		} else if (end == NULL)
-			end = l;
-
+		} else if ((iir & UART_IIR_BUSY) == UART_IIR_BUSY) {
+			 
+			unsigned int status;
+			status = *(volatile u32 *)up->port.private_data;
+			serial_out(up, UART_LCR, up->lcr);
+			handled = 1;
+			end = NULL;
+		}
+		ier = serial_in(up, UART_IER);
+		 
+		if(ier & UART_IER_THRI) {
+			lsr = serial_in(up, UART_LSR);
+			 
+			if(lsr & (UART_LSR_THRE | UART_LSR_TEMT)) {
+				 
+				spin_lock(&up->port.lock);
+				transmit_chars(up);	 
+				spin_unlock(&up->port.lock);
+				my_flags |= 0x02;   
+				handled = 1;
+				end = NULL;
+			}
+		}
+		 
+		if(0x00 == my_flags) {
+			if (end == NULL)
+				end = l;
+		}
 		l = l->next;
-
 		if (l == i->head && pass_counter++ > PASS_LIMIT) {
-			/* If we hit this, we're dead. */
-			printk_ratelimited(KERN_ERR
-				"serial8250: too much work for irq%d\n", irq);
+			printk_ratelimited(KERN_ERR "serial8250: too much work for "
+				"irq%d\n", irq);
 			break;
 		}
 	} while (l != end);
-
 	spin_unlock(&i->lock);
-
-	pr_debug("%s(%d): end\n", __func__, irq);
 
 	return IRQ_RETVAL(handled);
 }
