@@ -8,7 +8,7 @@
  * clock, since the 16550A is capable of handling a top speed of 1.5
  * megabits/second; but this requires a faster clock.
  */
-#define BASE_BAUD (1843200/16)
+#define BASE_BAUD ( 14745600 / 16 )
 
 /* Standard COM flags (except for COM4, because of the 8514 problem) */
 #ifdef CONFIG_SERIAL_8250_DETECT_IRQ
@@ -21,9 +21,9 @@
 
 #define SERIAL_PORT_DFNS								\
 	/* UART		CLK		PORT	IRQ	FLAGS			    */	\
-	{ .uart = 0,	BASE_BAUD,	0x3F8,	4,	STD_COMX_FLAGS	}, /* ttyS0 */	\
-	{ .uart = 0,	BASE_BAUD,	0x2F8,	3,	STD_COMX_FLAGS	}, /* ttyS1 */	\
-	{ .uart = 0,	BASE_BAUD,	0x3E8,	4,	STD_COMX_FLAGS	}, /* ttyS2 */	\
-	{ .uart = 0,	BASE_BAUD,	0x2E8,	3,	STD_COM4_FLAGS	}, /* ttyS3 */
+	{ .uart = 0,	BASE_BAUD,	0x3F8,	38,	STD_COMX_FLAGS	}, /* ttyS0 */	\
+	{ .uart = 0,	BASE_BAUD,	0x2F8,	38,	STD_COMX_FLAGS	}, /* ttyS1 */	\
+	{ .uart = 0,	BASE_BAUD,	0x3E8,	38,	STD_COMX_FLAGS	}, /* ttyS2 */	\
+	{ .uart = 0,	BASE_BAUD,	0x2E8,	38,	STD_COM4_FLAGS	}, /* ttyS3 */
 
 #endif /* _ASM_X86_SERIAL_H */
